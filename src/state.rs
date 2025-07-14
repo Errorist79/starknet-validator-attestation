@@ -191,31 +191,51 @@ impl State {
 
                     if !attestation_done {
                         tracing::debug!(block_hash=%attestation_params.block_hash, "Sending attestation transaction");
-                        let transaction_hash = client
+                        let result = client
                             .attest(
                                 attestation_info.operational_address,
                                 signer,
                                 attestation_params.block_hash,
                             )
-                            .await
-                            .context("Sending attestation transaction")?;
+                            .await;
 
-                        tracing::info!(?transaction_hash, "Attestation transaction sent");
+                        match result {
+                            Ok(transaction_hash) => {
+                                tracing::info!(?transaction_hash, "Attestation transaction sent");
 
-                        metrics::gauge!("validator_attestation_last_attestation_timestamp_seconds")
-                            .set(
-                                SystemTime::now()
-                                    .duration_since(SystemTime::UNIX_EPOCH)?
-                                    .as_secs_f64(),
-                            );
-                        metrics::counter!("validator_attestation_attestation_submitted_count")
-                            .increment(1);
+                                metrics::gauge!(
+                                    "validator_attestation_last_attestation_timestamp_seconds"
+                                )
+                                .set(
+                                    SystemTime::now()
+                                        .duration_since(SystemTime::UNIX_EPOCH)?
+                                        .as_secs_f64(),
+                                );
+                                metrics::counter!(
+                                    "validator_attestation_attestation_submitted_count"
+                                )
+                                .increment(1);
 
-                        // Move to AttestationSubmitted state to prevent duplicate submissions
-                        State::AttestationSubmitted {
-                            attestation_info,
-                            attestation_params,
-                            transaction_hash,
+                                // Move to AttestationSubmitted state to prevent duplicate submissions
+                                State::AttestationSubmitted {
+                                    attestation_info,
+                                    attestation_params,
+                                    transaction_hash,
+                                }
+                            }
+                            Err(err) => {
+                                tracing::error!(error = ?err, "Failed to send attestation transaction");
+                                metrics::counter!(
+                                    "validator_attestation_attestation_failure_count"
+                                )
+                                .increment(1);
+
+                                // Stay in AttestationWindowActive state to retry in next block
+                                State::AttestationWindowActive {
+                                    attestation_info,
+                                    attestation_params,
+                                }
+                            }
                         }
                     } else {
                         tracing::debug!("Attestation already done");
