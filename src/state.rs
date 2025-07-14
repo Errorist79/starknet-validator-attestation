@@ -115,6 +115,7 @@ impl State {
                 .get_attestation_info(operational_address)
                 .await
                 .context("Getting attestation info")?;
+            let expected_attestation_block = attestation_info.calculate_expected_attestation_block();
             tracing::info!(
                 staker_address=?attestation_info.staker_address,
                 operational_address=?attestation_info.operational_address,
@@ -123,6 +124,7 @@ impl State {
                 epoch_start=%attestation_info.current_epoch_starting_block,
                 epoch_length=%attestation_info.epoch_len,
                 attestation_window=%attestation_info.attestation_window,
+                expected_attestation_block=%expected_attestation_block,
                 "New epoch started"
             );
             State::from_attestation_info(attestation_info)
