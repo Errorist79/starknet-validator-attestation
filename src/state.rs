@@ -41,9 +41,14 @@ pub enum State {
         attestation_info: AttestationInfo,
         block_to_attest: u64,
     },
-    Attesting {
+    AttestationWindowActive {
         attestation_info: AttestationInfo,
         attestation_params: AttestationParams,
+    },
+    AttestationSubmitted {
+        attestation_info: AttestationInfo,
+        attestation_params: AttestationParams,
+        transaction_hash: Felt,
     },
     WaitingForNextEpoch {
         attestation_info: AttestationInfo,
@@ -74,7 +79,10 @@ impl State {
             State::BeforeBlockToAttest {
                 attestation_info, ..
             } => attestation_info,
-            State::Attesting {
+            State::AttestationWindowActive {
+                attestation_info, ..
+            } => attestation_info,
+            State::AttestationSubmitted {
                 attestation_info, ..
             } => attestation_info,
             State::WaitingForNextEpoch { attestation_info } => attestation_info,
@@ -133,7 +141,7 @@ impl State {
                 // We have received the block hash for the block to attest.
                 Ordering::Equal => {
                     let attestation_window = attestation_info.attestation_window;
-                    State::Attesting {
+                    State::AttestationWindowActive {
                         attestation_info,
                         attestation_params: AttestationParams {
                             block_hash,
@@ -150,7 +158,7 @@ impl State {
                         .await
                         .map(|block_hash| {
                             let attestation_window = attestation_info.attestation_window;
-                            State::Attesting {
+                            State::AttestationWindowActive {
                                 attestation_info,
                                 attestation_params: AttestationParams {
                                     block_hash,
@@ -163,15 +171,16 @@ impl State {
                         })?
                 }
             },
-            State::Attesting {
+            State::AttestationWindowActive {
                 attestation_info,
                 attestation_params,
             } => match attestation_params.in_window(block_number) {
-                Ordering::Less => State::Attesting {
+                Ordering::Less => State::AttestationWindowActive {
                     attestation_info,
                     attestation_params,
                 },
                 Ordering::Equal => {
+                    // First time in attestation window - check if we need to attest
                     let attestation_done = client
                         .attestation_done_in_current_epoch(attestation_info.staker_address)
                         .await
@@ -179,41 +188,31 @@ impl State {
 
                     if !attestation_done {
                         tracing::debug!(block_hash=%attestation_params.block_hash, "Sending attestation transaction");
-                        let result = client
+                        let transaction_hash = client
                             .attest(
                                 attestation_info.operational_address,
                                 signer,
                                 attestation_params.block_hash,
                             )
-                            .await;
-                        match result {
-                            Ok(transaction_hash) => {
-                                tracing::info!(?transaction_hash, "Attestation transaction sent");
+                            .await
+                            .context("Sending attestation transaction")?;
 
-                                metrics::gauge!(
-                                    "validator_attestation_last_attestation_timestamp_seconds"
-                                )
-                                .set(
-                                    SystemTime::now()
-                                        .duration_since(SystemTime::UNIX_EPOCH)?
-                                        .as_secs_f64(),
-                                );
-                                metrics::counter!(
-                                    "validator_attestation_attestation_submitted_count"
-                                )
-                                .increment(1);
-                            }
-                            Err(err) => {
-                                tracing::error!(error = ?err, "Failed to send attestation transaction");
-                                metrics::counter!(
-                                    "validator_attestation_attestation_failure_count"
-                                )
-                                .increment(1);
-                            }
-                        };
-                        State::Attesting {
+                        tracing::info!(?transaction_hash, "Attestation transaction sent");
+
+                        metrics::gauge!("validator_attestation_last_attestation_timestamp_seconds")
+                            .set(
+                                SystemTime::now()
+                                    .duration_since(SystemTime::UNIX_EPOCH)?
+                                    .as_secs_f64(),
+                            );
+                        metrics::counter!("validator_attestation_attestation_submitted_count")
+                            .increment(1);
+
+                        // Move to AttestationSubmitted state to prevent duplicate submissions
+                        State::AttestationSubmitted {
                             attestation_info,
                             attestation_params,
+                            transaction_hash,
                         }
                     } else {
                         tracing::debug!("Attestation already done");
@@ -222,6 +221,29 @@ impl State {
                 }
                 Ordering::Greater => {
                     // We're past the attestation window
+                    metrics::counter!("validator_attestation_missed_epochs_count").increment(1);
+                    State::WaitingForNextEpoch { attestation_info }
+                }
+            },
+            State::AttestationSubmitted {
+                attestation_info,
+                attestation_params,
+                transaction_hash,
+            } => match attestation_params.in_window(block_number) {
+                Ordering::Less | Ordering::Equal => {
+                    // Transaction already submitted - wait for confirmation
+                    State::AttestationSubmitted {
+                        attestation_info,
+                        attestation_params,
+                        transaction_hash,
+                    }
+                }
+                Ordering::Greater => {
+                    // Window expired - this shouldn't happen but handle gracefully
+                    tracing::warn!(
+                        ?transaction_hash,
+                        "Attestation window expired without confirmation"
+                    );
                     metrics::counter!("validator_attestation_missed_epochs_count").increment(1);
                     State::WaitingForNextEpoch { attestation_info }
                 }
@@ -243,7 +265,7 @@ impl State {
 
     fn handle_attestation_successful_event(self, staker_address: Felt, epoch_id: u64) -> Self {
         match self {
-            State::Attesting {
+            State::AttestationWindowActive {
                 attestation_info,
                 attestation_params,
             } => {
@@ -256,9 +278,30 @@ impl State {
                     Self::WaitingForNextEpoch { attestation_info }
                 } else {
                     tracing::trace!(?staker_address, %epoch_id, "Skipping attestation successful event for other staker");
-                    State::Attesting {
+                    State::AttestationWindowActive {
                         attestation_info,
                         attestation_params,
+                    }
+                }
+            }
+            State::AttestationSubmitted {
+                attestation_info,
+                attestation_params,
+                transaction_hash,
+            } => {
+                if attestation_info.staker_address == staker_address
+                    && attestation_info.epoch_id == epoch_id
+                {
+                    tracing::info!(?staker_address, %epoch_id, ?transaction_hash, "Attestation confirmed");
+                    metrics::counter!("validator_attestation_attestation_confirmed_count")
+                        .increment(1);
+                    Self::WaitingForNextEpoch { attestation_info }
+                } else {
+                    tracing::trace!(?staker_address, %epoch_id, "Skipping attestation successful event for other staker");
+                    State::AttestationSubmitted {
+                        attestation_info,
+                        attestation_params,
+                        transaction_hash,
                     }
                 }
             }
@@ -355,7 +398,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_matches!(&state, State::Attesting { attestation_params, .. } if *attestation_params == AttestationParams {
+        assert_matches!(&state, State::AttestationWindowActive { attestation_params, .. } if *attestation_params == AttestationParams {
             block_hash: BLOCK_HASH,
             start_of_attestation_window: initial_block_to_attest + MIN_ATTESTATION_WINDOW,
             end_of_attestation_window: initial_block_to_attest + initial_attestation_info.attestation_window as u64,
@@ -373,7 +416,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_matches!(&state, State::Attesting { .. });
+        assert_matches!(&state, State::AttestationSubmitted { .. });
         assert!(client.attestation_sent());
 
         // Confirmation event for the attestation
@@ -407,7 +450,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_matches!(&state, State::Attesting { attestation_params, .. } if *attestation_params == AttestationParams {
+        assert_matches!(&state, State::AttestationWindowActive { attestation_params, .. } if *attestation_params == AttestationParams {
             block_hash: BLOCK_HASH,
             start_of_attestation_window: next_block_to_attest + MIN_ATTESTATION_WINDOW,
             end_of_attestation_window: next_block_to_attest + next_attestation_info.attestation_window as u64,
@@ -454,7 +497,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_matches!(&state, State::Attesting { attestation_params, .. } if *attestation_params == AttestationParams {
+        assert_matches!(&state, State::AttestationWindowActive { attestation_params, .. } if *attestation_params == AttestationParams {
             block_hash: BLOCK_HASH,
             start_of_attestation_window: initial_block_to_attest + MIN_ATTESTATION_WINDOW,
             end_of_attestation_window: initial_block_to_attest + initial_attestation_info.attestation_window as u64,
@@ -473,7 +516,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_matches!(&state, State::Attesting { .. });
+        assert_matches!(&state, State::AttestationSubmitted { .. });
         assert!(client.attestation_sent());
 
         // Confirmation event for the attestation
@@ -507,7 +550,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_matches!(&state, State::Attesting { attestation_params, .. } if *attestation_params == AttestationParams {
+        assert_matches!(&state, State::AttestationWindowActive { attestation_params, .. } if *attestation_params == AttestationParams {
             block_hash: BLOCK_HASH,
             start_of_attestation_window: next_block_to_attest + MIN_ATTESTATION_WINDOW,
             end_of_attestation_window: next_block_to_attest + next_attestation_info.attestation_window as u64,

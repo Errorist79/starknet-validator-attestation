@@ -81,6 +81,7 @@ pub struct StarknetRpcClient {
     client: JsonRpcClient<HttpTransport>,
     staking_contract_address: Felt,
     attestation_contract_address: Felt,
+    current_nonce: tokio::sync::Mutex<Option<u64>>,
 }
 
 impl Client for StarknetRpcClient {
@@ -92,6 +93,29 @@ impl Client for StarknetRpcClient {
     ) -> Result<Felt, ClientError> {
         let chain_id = self.client.chain_id().await.context("Getting chain ID")?;
 
+        // Get current nonce or fetch from chain
+        let nonce = {
+            let mut nonce_guard = self.current_nonce.lock().await;
+            match *nonce_guard {
+                Some(nonce) => nonce,
+                None => {
+                    let chain_nonce = self
+                        .client
+                        .get_nonce(
+                            starknet::core::types::BlockId::Tag(
+                                starknet::core::types::BlockTag::Pending,
+                            ),
+                            operational_address,
+                        )
+                        .await?;
+                    let nonce_u64: u64 =
+                        chain_nonce.try_into().context("Converting nonce to u64")?;
+                    *nonce_guard = Some(nonce_u64);
+                    nonce_u64
+                }
+            }
+        };
+
         let account = ClearSigningAccount::new(&self.client, signer, operational_address, chain_id);
 
         let result = account
@@ -100,11 +124,18 @@ impl Client for StarknetRpcClient {
                 selector: get_selector_from_name("attest").unwrap(),
                 calldata: vec![block_hash],
             }])
+            .nonce(nonce.into())
             .gas_price_estimate_multiplier(3.0)
             .gas_estimate_multiplier(3.0)
             .send()
             .await
             .context("Sending transaction")?;
+
+        // Increment nonce for next transaction
+        {
+            let mut nonce_guard = self.current_nonce.lock().await;
+            *nonce_guard = Some(nonce + 1);
+        }
 
         Ok(result.transaction_hash)
     }
@@ -198,6 +229,7 @@ impl StarknetRpcClient {
             client,
             staking_contract_address,
             attestation_contract_address,
+            current_nonce: tokio::sync::Mutex::new(None),
         }
     }
 
