@@ -115,7 +115,8 @@ impl State {
                 .get_attestation_info(operational_address)
                 .await
                 .context("Getting attestation info")?;
-            let expected_attestation_block = attestation_info.calculate_expected_attestation_block();
+            let expected_attestation_block =
+                attestation_info.calculate_expected_attestation_block();
             tracing::info!(
                 staker_address=?attestation_info.staker_address,
                 operational_address=?attestation_info.operational_address,
